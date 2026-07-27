@@ -1,0 +1,50 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Parent {
+  id       String    @id @default(uuid())
+  name     String
+  email    String    @unique
+  students Student[]
+}
+
+model Student {
+  id       String    @id @default(uuid())
+  parentId String
+  name     String
+  parent   Parent    @relation(fields: [parentId], references: [id])
+  bookings Booking[]
+}
+
+model TrialClass {
+  id         String    @id @default(uuid())
+  startTime  DateTime
+  capacity   Int       @default(4)
+  bookings   Booking[]
+}
+
+model Booking {
+  id              String           @id @default(uuid())
+  studentId       String
+  trialClassId    String
+  status          String           // PENDING_PAYMENT, CONFIRMED, PAYMENT_FAILED, CANCELLED
+  student         Student          @relation(fields: [studentId], references: [id])
+  trialClass      TrialClass       @relation(fields: [trialClassId], references: [id])
+  paymentAttempts PaymentAttempt[]
+
+  @@unique([studentId, trialClassId])
+}
+
+model PaymentAttempt {
+  id        String   @id @default(uuid())
+  bookingId String
+  status    String   // SUCCESS, FAILED
+  amount    Int
+  createdAt DateTime @default(now())
+  booking   Booking  @relation(fields: [bookingId], references: [id])
+}
