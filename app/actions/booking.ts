@@ -2,10 +2,10 @@
 
 import { prisma } from '../../lib/prisma'
 import { revalidatePath } from 'next/cache'
+import { addMinutes } from 'date-fns'
+import { v4 as uuidv4 } from 'uuid'
 
-// Initiate a booking, setting it to PENDING_PAYMENT
 export async function initiateBooking(studentId: string, trialClassId: string) {
-  // Check if there is already a confirmed booking for this student and class
   const existingConfirmed = await prisma.booking.findFirst({
     where: {
       studentId,
@@ -18,67 +18,117 @@ export async function initiateBooking(studentId: string, trialClassId: string) {
     return { error: 'Student is already confirmed for this class.' }
   }
 
-  // Find existing booking (might be pending or failed) or create a new one
-  let booking = await prisma.booking.findUnique({
+  // Check if class is already full (considering confirmed AND active holds)
+  // We use executeRaw/queryRaw for precision or just Prisma count
+  const activeBookingsCount = await prisma.booking.count({
     where: {
-      studentId_trialClassId: {
-        studentId,
-        trialClassId
-      }
+      trialClassId,
+      OR: [
+        { status: 'CONFIRMED' },
+        { status: 'PENDING_PAYMENT', holdExpiresAt: { gt: new Date() } }
+      ]
     }
   })
 
+  // We need to fetch capacity
+  const trialClass = await prisma.trialClass.findUnique({ where: { id: trialClassId } })
+  if (!trialClass) return { error: 'Class not found' }
+
+  if (activeBookingsCount >= trialClass.capacity) {
+    // If we already have a pending booking that is NOT expired, we are part of that count
+    const myActiveBooking = await prisma.booking.findFirst({
+      where: {
+        studentId,
+        trialClassId,
+        status: 'PENDING_PAYMENT',
+        holdExpiresAt: { gt: new Date() }
+      }
+    })
+    
+    if (!myActiveBooking) {
+      return { error: 'Class is currently full or seats are reserved. Please try again later.' }
+    }
+  }
+
+  // Hold for 10 minutes
+  const expiresAt = addMinutes(new Date(), 10)
+
+  let booking = await prisma.booking.findUnique({
+    where: { studentId_trialClassId: { studentId, trialClassId } }
+  })
+
   if (booking) {
-    // If it exists, reset status to PENDING_PAYMENT
     booking = await prisma.booking.update({
       where: { id: booking.id },
-      data: { status: 'PENDING_PAYMENT' }
+      data: { status: 'PENDING_PAYMENT', holdExpiresAt: expiresAt }
     })
   } else {
     booking = await prisma.booking.create({
       data: {
         studentId,
         trialClassId,
-        status: 'PENDING_PAYMENT'
+        status: 'PENDING_PAYMENT',
+        holdExpiresAt: expiresAt
       }
     })
   }
 
+  // Generate a client idempotency key for the payment step
+  const idempotencyKey = uuidv4()
+
   revalidatePath('/')
-  return { booking }
+  return { booking, idempotencyKey }
 }
 
-// Process mock payment and confirm booking with atomic update
-export async function processPayment(bookingId: string) {
-  // 1. Fetch booking to ensure it's pending payment
+export async function processPayment(bookingId: string, idempotencyKey: string) {
+  // 1. Idempotency Check
+  const existingPayment = await prisma.paymentAttempt.findUnique({
+    where: { idempotencyKey }
+  })
+
+  if (existingPayment && existingPayment.status === 'SUCCESS') {
+    return { success: true, note: 'Idempotent replay' }
+  }
+
   const booking = await prisma.booking.findUnique({
     where: { id: bookingId }
   })
 
-  if (!booking) {
-    return { error: 'Booking not found' }
+  if (!booking) return { error: 'Booking not found' }
+  if (booking.status === 'CONFIRMED') return { error: 'Booking is already confirmed' }
+
+  // Check if our hold expired
+  if (!booking.holdExpiresAt || booking.holdExpiresAt < new Date()) {
+    return { error: 'Your seat reservation expired. Please try booking again.' }
   }
 
-  if (booking.status === 'CONFIRMED') {
-    return { error: 'Booking is already confirmed' }
-  }
-
-  // 2. Mock payment logic (simulate delay)
+  // 2. Mock payment logic
   await new Promise(resolve => setTimeout(resolve, 1000))
   
-  // Record payment attempt
-  await prisma.paymentAttempt.create({
-    data: {
-      bookingId,
-      status: 'SUCCESS',
-      amount: 1000 // e.g. 10.00 USD
+  // Create or retrieve payment attempt (idempotent upsert to avoid unique key race)
+  try {
+    await prisma.paymentAttempt.create({
+      data: {
+        bookingId,
+        idempotencyKey,
+        status: 'SUCCESS',
+        amount: 1000
+      }
+    })
+  } catch (e: any) {
+    // If two concurrent requests race on the same idempotency key,
+    // one will win the DB write; the loser gets a unique constraint error.
+    // We treat this as a successful idempotent replay.
+    if (e.code === 'P2002') {
+      const existing = await prisma.paymentAttempt.findUnique({ where: { idempotencyKey } })
+      if (existing?.status === 'SUCCESS') return { success: true, note: 'Idempotent replay' }
     }
-  })
+    throw e
+  }
 
   // 3. Atomic confirmation
-  // The subquery checks if the class currently has < 4 confirmed bookings.
-  // If true, the update succeeds and returns rows affected = 1.
-  // If false, it returns rows affected = 0.
+  // Ensure we only confirm if we don't exceed capacity, accounting for active holds and confirmed seats
+  const capacity = 4
   const updatedRows = await prisma.$executeRaw`
     UPDATE "Booking"
     SET "status" = 'CONFIRMED'
@@ -86,46 +136,35 @@ export async function processPayment(bookingId: string) {
     AND (
         SELECT COUNT(*)
         FROM "Booking"
-        WHERE "trialClassId" = ${booking.trialClassId} AND "status" = 'CONFIRMED'
-    ) < 4;
+        WHERE "trialClassId" = ${booking.trialClassId} 
+        AND (
+            "status" = 'CONFIRMED' 
+            OR ("status" = 'PENDING_PAYMENT' AND "holdExpiresAt" > NOW())
+        )
+        AND "id" != ${bookingId}
+    ) < ${capacity};
   `
 
   if (updatedRows === 0) {
-    // Check if the class is actually full to differentiate from "booking not found" error
-    const confirmedCount = await prisma.booking.count({
-      where: {
-        trialClassId: booking.trialClassId,
-        status: 'CONFIRMED'
-      }
+    await prisma.booking.update({
+      where: { id: bookingId },
+      data: { status: 'PAYMENT_FAILED' } 
     })
-
-    if (confirmedCount >= 4) {
-      // Transition booking to PAYMENT_FAILED or similar since it was overbooked
-      await prisma.booking.update({
-        where: { id: bookingId },
-        data: { status: 'PAYMENT_FAILED' } // Note: real system might do REFUND_REQUIRED
-      })
-      revalidatePath('/')
-      return { error: 'The class reached full capacity before your payment completed. Your payment has been refunded.' }
-    }
-    
-    return { error: 'Failed to confirm booking.' }
+    revalidatePath('/')
+    return { error: 'The class reached full capacity. Your payment has been refunded.' }
   }
 
   revalidatePath('/')
   return { success: true }
 }
 
-// Helper to fetch data for the dashboard
 export async function getDashboardData() {
   const parent = await prisma.parent.findFirst({
     include: {
       students: {
         include: {
           bookings: {
-            include: {
-              trialClass: true
-            }
+            include: { trialClass: true }
           }
         }
       }
@@ -135,7 +174,12 @@ export async function getDashboardData() {
   const classes = await prisma.trialClass.findMany({
     include: {
       bookings: {
-        where: { status: 'CONFIRMED' }
+        where: {
+          OR: [
+            { status: 'CONFIRMED' },
+            { status: 'PENDING_PAYMENT', holdExpiresAt: { gt: new Date() } }
+          ]
+        }
       }
     },
     orderBy: { startTime: 'asc' }

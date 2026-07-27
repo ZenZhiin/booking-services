@@ -33,6 +33,7 @@ model Booking {
   studentId       String
   trialClassId    String
   status          String           // PENDING_PAYMENT, CONFIRMED, PAYMENT_FAILED, CANCELLED
+  holdExpiresAt   DateTime?
   student         Student          @relation(fields: [studentId], references: [id])
   trialClass      TrialClass       @relation(fields: [trialClassId], references: [id])
   paymentAttempts PaymentAttempt[]
@@ -41,10 +42,11 @@ model Booking {
 }
 
 model PaymentAttempt {
-  id        String   @id @default(uuid())
-  bookingId String
-  status    String   // SUCCESS, FAILED
-  amount    Int
+  id             String   @id @default(uuid())
+  bookingId      String
+  idempotencyKey String?  @unique
+  status         String   // SUCCESS, FAILED
+  amount         Int
   createdAt DateTime @default(now())
   booking   Booking  @relation(fields: [bookingId], references: [id])
 }
